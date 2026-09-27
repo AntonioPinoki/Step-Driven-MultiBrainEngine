@@ -1,0 +1,4 @@
+fastapi==0.140.0
+uvicorn==0.51.0
+openai==2.48.0
+gradio==6.25.0

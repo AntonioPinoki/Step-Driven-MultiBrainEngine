@@ -1,0 +1,10 @@
+{
+  "display_name": "S-MultiBrainConnecter",
+  "loading_order": 50,
+  "generate_interceptor": "brainEngineContextInterceptor",
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Step-driven-MultiBrainEngine",
+  "version": "0.4.0",
+  "auto_update": false
+}

@@ -1,0 +1,26 @@
+Step-driven MultiBrainEngine
+Copyright (c) 2026 AntonioPinoki
+https://github.com/AntonioPinoki
+
+This project is based in part on:
+
+  MultiAgent-BrainEngine-SillyTavern
+  by DonBananas
+  https://github.com/DonBananas/MultiAgent-BrainEngine-SillyTavern
+
+The upstream repository identifies its license as the MIT License. A verbatim
+copy of the upstream LICENSE file, as retrieved from its main branch on
+2026-08-30, is included in LICENSE-UPSTREAM-MIT. The placeholder appearing in
+its copyright line was present in the upstream file and has been preserved
+without alteration.
+
+Portions originating from that repository remain available under the MIT
+License. Modifications and original contributions copyrighted by AntonioPinoki
+are provided under the Step-driven MultiBrainEngine Source-Available License
+1.0 in LICENSE.
+
+The source-available license permits use, modification, free redistribution,
+commercial services, and commercial use of resulting works, but it prohibits
+charging for the software itself or for access to a copy of it.
+
+No endorsement by DonBananas or the upstream project is implied.

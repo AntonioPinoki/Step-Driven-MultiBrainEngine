@@ -1,0 +1,3 @@
+code,display_name,enabled,fallback,translator_note
+en,English,true,,"Source language and final fallback"
+ja,日本語,true,en,"Japanese UI"

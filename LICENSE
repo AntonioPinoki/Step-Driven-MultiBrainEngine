@@ -1,0 +1,106 @@
+Step-driven MultiBrainEngine Source-Available License 1.0
+
+Copyright (c) 2026 AntonioPinoki
+
+This license applies only to the portions of Step-driven MultiBrainEngine for
+which AntonioPinoki owns the copyright (the "Covered Software"). Third-party
+materials, including portions derived from MultiAgent-BrainEngine-SillyTavern,
+remain subject to their respective licenses. See NOTICE and
+LICENSE-UPSTREAM-MIT.
+
+1. Permission
+
+Subject to the conditions below, permission is granted, free of charge, to any
+person obtaining a copy of the Covered Software to:
+
+a. use and run the Covered Software for personal, educational, research,
+   nonprofit, or commercial purposes;
+b. inspect, copy, and modify the Covered Software;
+c. redistribute the Covered Software, with or without modifications, without
+   charge; and
+d. use the Covered Software in connection with commercial services and
+   commercial creative work.
+
+2. Permitted Commercial Activity
+
+For clarity, you may charge for:
+
+a. operating a hosted service, API, or other service that uses the Covered
+   Software;
+b. installation, configuration, integration, consulting, training, support,
+   maintenance, or hosting;
+c. content, media, software output, or other works created with assistance from
+   the Covered Software; and
+d. a product or service in which the Covered Software is used internally and
+   is not itself offered to the customer for a fee.
+
+3. No Sale of the Software Itself
+
+You may not, directly or indirectly, require payment or other monetary
+consideration in exchange for:
+
+a. a copy of the Covered Software or a modified version of it;
+b. downloading, receiving, licensing, or obtaining source code or executable
+   code of the Covered Software or a modified version of it; or
+c. a bundle, membership, subscription, product, or transaction whose primary
+   purpose or substantial value is to provide a copy of the Covered Software
+   or a modified version of it.
+
+You may not avoid this restriction by describing the payment as a donation,
+service fee, access fee, handling fee, membership fee, or payment for an item
+of nominal value when the payment is effectively required to obtain the
+Covered Software.
+
+This section does not prohibit the commercial activities expressly permitted
+by Section 2, provided that customers are paying for the service, assistance,
+or resulting work rather than for a copy of the Covered Software itself.
+
+4. Conditions on Redistribution
+
+Every redistribution of the Covered Software or a modified version must:
+
+a. be provided without charge;
+b. include this license and the copyright notice above;
+c. include NOTICE and all applicable third-party license and attribution
+   notices, including LICENSE-UPSTREAM-MIT; and
+d. license modifications to the Covered Software under this same license, with
+   no additional restriction that conflicts with it.
+
+You must clearly identify material modifications and must not state or imply
+that a modified version is the official version or is endorsed by AntonioPinoki
+or any upstream author.
+
+5. No Trademark License
+
+This license does not grant permission to use the names, logos, trademarks, or
+service marks of AntonioPinoki, Step-driven MultiBrainEngine, DonBananas, or
+any upstream project, except as reasonably necessary for attribution and
+accurate description of origin.
+
+6. Termination and Cure
+
+Your rights under this license terminate automatically if you fail to comply
+with it. Your rights are reinstated if you cure the violation within 30 days
+after becoming aware of it. Reinstatement does not limit any claim arising
+from the violation.
+
+7. Disclaimer of Warranty
+
+THE COVERED SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE COVERED SOFTWARE OR ITS USE OR OTHER
+DEALINGS.
+
+8. Severability
+
+If any provision of this license is held unenforceable, that provision will be
+limited or removed only to the minimum extent necessary, and the remaining
+provisions will remain in effect.
+
+9. Entire Permission
+
+This license grants only the permissions stated above. No rights in third-party
+materials are granted by this license.
