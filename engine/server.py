@@ -1,4 +1,5 @@
-﻿# --- START OF FILE server.py ---
+﻿from step_inputs import resolve_prior_outputs, connector_context
+# --- START OF FILE server.py ---
 # Step-driven MultiBrainEngine = 6-agent biopsychosocial brain.
 #
 # Usage is identical to Project silly: run this server, connect SillyTavern
@@ -21,11 +22,17 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncOpenAI
+from app_version import APP_VERSION
 import context_budget
 import provider_config
 import prompt_store
 import lorebook_store
 import lore_state
+import conversation_state
+import variables
+import persistent_lore
+import bundle_store
+from routing_contract import prepare_routing_contract
 from step_history import (
     PresetHistoryState, extract_step_history, parse_history_turns,
     select_history_turns, step_output_tag, visible_messages,
@@ -39,7 +46,7 @@ try:
 except Exception:
     pass
 
-app = FastAPI()
+app = FastAPI(version=APP_VERSION)
 
 # SillyTavern's browser UI runs on a separate local port. Permit only local
 # browser origins to call the connector API.
@@ -83,6 +90,15 @@ def progress_log(*args, **kwargs):
     """Print optional BrainEngine progress messages without affecting access logs."""
     if PROGRESS_LOGS_ENABLED:
         print(*args, **kwargs)
+
+
+UPDATE_DIAGNOSTICS = deque(maxlen=100)
+
+
+def update_diagnostic(kind, **fields):
+    record = {"kind": kind, **fields}
+    UPDATE_DIAGNOSTICS.append(record)
+    progress_log("Update diagnostic: " + json.dumps(record, ensure_ascii=False))
 
 
 def generation_progress(turn_id, stage, event, provider, elapsed=None):
@@ -169,6 +185,23 @@ def _snapshot_match_text(text, role):
     return normalized.strip()
 
 
+def _snapshot_message_matches(snapshot_message, raw_messages, grouped=False):
+    role = snapshot_message.get("role")
+    text = snapshot_message.get("text")
+    if role not in {"user", "assistant"} or not isinstance(text, str):
+        return False
+    expected = _snapshot_match_text(text, role)
+    speaker = _safe_display_name(snapshot_message.get("name"))
+    prefix = speaker + ": " if grouped and speaker else None
+    candidates = [m for m in (raw_messages if isinstance(raw_messages, list) else [])
+                  if isinstance(m, dict) and m.get("role") == role and isinstance(m.get("content"), str)]
+    for message in candidates[-4:]:
+        candidate = _snapshot_match_text(message["content"], role)
+        if candidate == expected or prefix and candidate.startswith(prefix) and candidate[len(prefix):] == expected:
+            return True
+    return False
+
+
 def _snapshot_matches_request(context, data, raw_messages):
     chat = context.get("chat") if isinstance(context, dict) else None
     chat = chat if isinstance(chat, dict) else {}
@@ -180,20 +213,7 @@ def _snapshot_matches_request(context, data, raw_messages):
     latest = chat.get("last_message")
     if not isinstance(latest, dict):
         return False
-    expected_role = str(latest.get("role") or "")
-    expected_text = latest.get("text")
-    if expected_role not in {"user", "assistant"} or not isinstance(expected_text, str):
-        return False
-    expected_text = _snapshot_match_text(expected_text, expected_role)
-    candidates = [
-        message for message in (raw_messages if isinstance(raw_messages, list) else [])
-        if isinstance(message, dict) and message.get("role") == expected_role
-        and isinstance(message.get("content"), str)
-    ]
-    return any(
-        _snapshot_match_text(message["content"], expected_role) == expected_text
-        for message in candidates[-4:]
-    )
+    return _snapshot_message_matches(latest, raw_messages, grouped=isinstance(context.get("group"), dict))
 
 
 def claim_sillytavern_role_binding(
@@ -236,6 +256,8 @@ def claim_sillytavern_role_binding(
                 f"ℹ️ {fallback_type} context claimed by unique fresh-snapshot fallback."
             )
     if len(matches) != 1:
+        reason = ("ambiguous" if len(matches) > 1 else "message_or_chat_id_mismatch" if fresh else "missing_or_expired")
+        update_diagnostic("connector_fallback", reason=reason, candidates=len(fresh), source="legacy_name_resolution")
         return None
     context = matches[0]
     try:
@@ -250,8 +272,10 @@ def claim_sillytavern_role_binding(
     char_name = _safe_display_name(character.get("name"))
     user_name = _safe_display_name(user.get("name"))
     if not char_name or not user_name:
+        update_diagnostic("connector_fallback", reason="missing_name", source="legacy_name_resolution")
         return None
 
+    update_diagnostic("connector_claim", source="matched_snapshot", accepted=True)
     chat = context.get("chat") or {}
     binding = {
         "user_name": user_name,
@@ -262,7 +286,13 @@ def claim_sillytavern_role_binding(
         # Used only by lore keyword matching. It is not appended to any LLM prompt.
         "lore_scan_context": _sillytavern_lore_scan_context(character, user),
         "lore_sources": _sillytavern_lore_sources(character, user, chat, group),
+        "connector_context": connector_context(context),
+        "state_branch_root": _safe_display_name((chat.get("metadata") or {}).get("main_chat")),
     }
+    prior_state = chat.get("prior_state")
+    if isinstance(prior_state, dict) and isinstance(prior_state.get("state"), str) and _snapshot_message_matches(
+        prior_state, raw_messages, grouped=bool(group)):
+        binding["prior_state"] = {"state": prior_state["state"]}
     if group:
         binding["group_characters"] = _safe_character_names(
             group.get("active_characters"), char_name)
@@ -299,9 +329,8 @@ def expand_role_placeholders(text, binding):
         "{{groupchar}}": ", ".join(binding.get("group_characters") or []),
         "{{allchar}}": ", ".join(binding.get("all_characters") or []),
     }
-    for placeholder, value in replacements.items():
-        source = source.replace(placeholder, value)
-    return source
+    return re.sub(r"\{\{(?:char|user|groupchar|allchar)\}\}",
+                  lambda match: replacements[match.group(0)], source)
 
 
 def expand_agent_prompt(agent, binding, group_prompt=""):
@@ -349,8 +378,8 @@ def extract_latest_assistant_think(raw_messages):
             return ""
         blocks = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL | re.IGNORECASE)
         return "\n\n".join(
-            lore_state.strip_information(block).strip()
-            for block in blocks if lore_state.strip_information(block).strip())
+            conversation_state.strip_state(lore_state.strip_information(block)).strip()
+            for block in blocks if conversation_state.strip_state(lore_state.strip_information(block)).strip())
     return ""
 
 
@@ -708,6 +737,7 @@ def build_reasoning_messages(base_messages, prompt, prior_context="", past_outpu
                              return_metadata=False):
     msgs = copy.deepcopy(base_messages)
     chat_indices = list(range(len(msgs)))
+    prompt, routing_contract = prepare_routing_contract(prompt, prior_context)
     step_instruction = (
         "<BE>\n"
         "CHANNEL: PRIVATE REASONING\n"
@@ -715,6 +745,8 @@ def build_reasoning_messages(base_messages, prompt, prior_context="", past_outpu
         f"[INTERNAL REASONING STEP]\n{prompt}\n"
         "</BE>"
     )
+    if routing_contract:
+        step_instruction = step_instruction.removesuffix("</BE>") + routing_contract + "\n</BE>"
     msgs.append({"role": "user", "content": step_instruction})
 
     context_sections = ["<BE>\nCHANNEL: PRIVATE REASONING"]
@@ -743,8 +775,13 @@ def build_reasoning_messages(base_messages, prompt, prior_context="", past_outpu
         "step tag, section label, delimiter, or control marker from the supplied context.",
         "Return only a new analysis for this step. Do not write the final roleplay reply.",
     ])
+    if "<be-variable-update-v1>" in prompt:
+        current_task.append("Exception: you may append the authorized terminal be-variable-update-v1 JSON block described in the variable instructions. Do not include it in the analysis body.")
     context_sections.append("\n".join(current_task))
     msgs.append({"role": "user", "content": "\n\n".join(context_sections) + "\n</BE>"})
+    if routing_contract:
+        # Opted-in routing instructions follow all earlier-step source data.
+        msgs[-2], msgs[-1] = msgs[-1], msgs[-2]
     if return_metadata:
         return msgs, {
             "chat_indices": chat_indices,
@@ -1013,7 +1050,7 @@ async def async_llm_call(system_prompt=None, scene_context=None, full_messages=N
                          pres_pen=0.0, sampling=None, max_tokens=2500,
                          is_writer=False, request=None, raise_on_error=False,
                          budget_metadata=None, context_snapshot=None,
-                         preflight_complete=False):
+                         preflight_complete=False, require_completed=False, output_metadata=None):
     current_temp = temp
     active_client = writer_client if is_writer else logic_client
     active_model = MODEL_NAME if is_writer else ACTIVE_LOGIC_MODEL
@@ -1061,6 +1098,11 @@ async def async_llm_call(system_prompt=None, scene_context=None, full_messages=N
                 **sampling_api_args(sampler, active_url, current_temp),
             ), request)
 
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if output_metadata is not None:
+                output_metadata["finish_reason"] = finish_reason
+            if require_completed and finish_reason not in {"stop", "length"}:
+                raise ValueError("Provider did not confirm a normal completion")
             content = response.choices[0].message.content
 
             if not content or content.strip() == "":
@@ -1231,6 +1273,25 @@ DEFAULT_SUMMARY = {
         "only the summary text; the server adds the summary tag."
     )
 }
+CONVERSATION_DIAGNOSTICS = {}
+PENDING_STATE_RESETS = {}
+
+
+def conversation_states():
+    return {"states": copy.deepcopy(list(CONVERSATION_DIAGNOSTICS.values())),
+            "diagnostics": copy.deepcopy(list(UPDATE_DIAGNOSTICS))}
+
+
+def queue_conversation_reset(chat_id, preset_id, scope):
+    if scope not in {"lore", "variables", "both"}:
+        raise ValueError("Choose lore, variables, or both")
+    key = (str(preset_id), str(chat_id))
+    if not chat_id or key not in CONVERSATION_DIAGNOSTICS:
+        raise ValueError("Select a known connected chat; no other chat will be changed")
+    PENDING_STATE_RESETS[key] = {"scope": scope, "id": uuid4().hex}
+    return "Reset queued for this chat's next normal generation. Continue does not apply or consume resets."
+
+
 def active_prompt_setup():
     return prompt_store.load_available_config(
         DEFAULT_REASONING_STEPS, DEFAULT_WRITER, DEFAULT_SUMMARY,
@@ -1268,7 +1329,7 @@ def activated_lore_by_agent(raw_messages, prompt_config, role_binding):
 
 def activated_lore_for_agent(raw_messages, prompt_config, role_binding, agent_id,
                              *, prior_outputs=(), past_outputs=(), state=None,
-                             config=None):
+                             config=None, persistent_active=None, persistent_blocked=None):
     """Evaluate one assignment immediately before its target executes."""
     config = config or active_lorebook_setup(prompt_config)
     book_ids = config.get("assignments", {}).get(str(agent_id), [])
@@ -1290,18 +1351,83 @@ def activated_lore_for_agent(raw_messages, prompt_config, role_binding, agent_id
     if past_outputs:
         sources["past_same_step"] = [str(value) for value in past_outputs]
     entries = []
+    assigned = [entry for book_id in book_ids if book_id in books for entry in books[book_id]["entries"]]
+    persistence_entries = [entry for entry in assigned if any(entry.get("persistence", {}).values())]
+    attempted = {}
+    if persistent_active is not None:
+        persistent_lore.evaluate(
+            lorebook_store, persistence_entries, raw_messages, config["settings"], sources,
+            state or {}, persistent_active, persistent_blocked, random, attempted=attempted)
     for book_id in book_ids:
         if book_id in books:
+            book = books[book_id]
+            if persistent_active is not None:
+                runtime_entries = []
+                for original in book["entries"]:
+                    identity = original["entry_id"]
+                    persistence = original.get("persistence", {})
+                    if identity in persistent_blocked or attempted.get(identity) is False:
+                        continue
+                    entry = copy.deepcopy(original)
+                    if persistence.get("enabled") and identity in persistent_active:
+                        entry.update(constant=True, observation_mode="standard", use_probability=False)
+                    elif attempted.get(identity) is True:
+                        entry["use_probability"] = False
+                    if persistence.get("control_only"):
+                        entry.update(content="", stages=[""])
+                    runtime_entries.append(entry)
+                book = {**book, "entries": runtime_entries}
             entries.extend(lorebook_store.activate_book(
-                books[book_id], raw_messages, config["settings"],
+                book, raw_messages, config["settings"],
                 search_sources=sources, lore_state=state or {}, apply_groups=False))
+    if persistent_active is not None:
+        for entry in entries:
+            persistence = entry.get("persistence", {})
+            if persistence.get("enabled"):
+                persistent_active.add(entry["entry_id"])
+            persistent_blocked.update(persistence.get("deactivates_entry_ids", []))
+        persistent_active.difference_update(persistent_blocked)
+        entries = [entry for entry in entries if entry["entry_id"] not in persistent_blocked
+                   and not entry.get("persistence", {}).get("control_only")]
+    before_groups = {entry["entry_id"] for entry in entries}
     entries = lorebook_store.select_entry_groups(entries)
-    return lorebook_store.render_lore(
+    after_groups = {entry["entry_id"] for entry in entries}
+    rendered = lorebook_store.render_lore(
         entries,
         expand=lambda text: expand_role_placeholders(text, role_binding),
         token_budget=config["settings"]["token_budget"],
         return_metadata=True,
     )
+    if persistent_active is not None:
+        assigned_ids = {entry["entry_id"] for entry in assigned}
+        known = {entry["entry_id"]: entry for book in books.values() for entry in book["entries"]}
+        budget_skipped = {item["entry_id"] for item in rendered["skipped"]}
+        diagnostics = []
+        for identity in sorted((persistent_active | persistent_blocked) & set(known)):
+            entry = known[identity]
+            if identity in persistent_blocked:
+                reason = "stopped_this_turn"
+            elif identity not in assigned_ids:
+                reason = "unassigned"
+            elif not entry["enabled"]:
+                reason = "disabled"
+            elif entry.get("persistence", {}).get("control_only"):
+                reason = "control_only"
+            elif identity in before_groups - after_groups:
+                reason = "group_selection"
+            elif identity in budget_skipped:
+                reason = "token_budget"
+            elif identity in after_groups:
+                content = next(item["content"] for item in entries if item["entry_id"] == identity)
+                reason = "injected" if str(content or "").strip() else "empty_content"
+            else:
+                reason = "not_a_candidate"
+            diagnostics.append({"entry_id": identity, "active": identity in persistent_active, "reason": reason})
+        rendered["persistent_diagnostics"] = diagnostics
+        if diagnostics:
+            update_diagnostic("persistent_lore_evaluation", preset_id=prompt_config.get("preset_id"),
+                              agent_id=str(agent_id), entries=diagnostics)
+    return rendered
 
 
 def _assistant_clip(text, limit):
@@ -1367,10 +1493,15 @@ async def staggered_call(coro, delay_seconds):
 async def run_reasoning_step(slot, messages, prior_context="", use_main=False, temp=0.3,
                              request=None, past_outputs=(), inheritance=None):
     context_snapshot = _context_snapshot(use_main)
+    effective_max_tokens = slot.get("max_output_tokens") or 2500
+    known_output_limit = context_snapshot.get("model_max_output_tokens")
+    if known_output_limit is not None and effective_max_tokens > known_output_limit:
+        raise HTTPException(status_code=400, detail={"error": "step_output_limit_exceeds_model",
+            "step_id": slot["id"], "requested": effective_max_tokens, "model_limit": known_output_limit})
     prepared = _prepare_reasoning_outbound(
         window_messages(messages, WINDOW_A5_DIRECTOR),
         slot["prompt"], prior_context, past_outputs,
-        max_tokens=2500, is_writer=use_main, context_snapshot=context_snapshot,
+        max_tokens=effective_max_tokens, is_writer=use_main, context_snapshot=context_snapshot,
     )
     prompt_messages = prepared.messages
     if inheritance is not None:
@@ -1381,6 +1512,10 @@ async def run_reasoning_step(slot, messages, prior_context="", use_main=False, t
             "provider": "writer" if use_main else "logic",
             "model": MODEL_NAME if use_main else ACTIVE_LOGIC_MODEL,
             "inserted_characters": [len(str(output)) for output in past_outputs],
+            "configured_max_output_tokens": slot.get("max_output_tokens"),
+            "effective_max_output_tokens": effective_max_tokens,
+            "model_output_limit": known_output_limit,
+            "model_output_limit_status": "known" if known_output_limit is not None else "unknown",
             "history_message_count": 1 if past_outputs else 0,
             "role_sequence": role_sequence,
             "final_role": role_sequence[-1] if role_sequence else None,
@@ -1390,6 +1525,7 @@ async def run_reasoning_step(slot, messages, prior_context="", use_main=False, t
     try:
         result = await async_llm_call(
             full_messages=prompt_messages, expect_json=False, temp=temp, sampling=slot,
+            max_tokens=effective_max_tokens, output_metadata=inheritance,
             is_writer=use_main, request=request, raise_on_error=True,
             context_snapshot=context_snapshot, preflight_complete=True,
         )
@@ -1447,10 +1583,10 @@ async def _stream_with_timeout(stream, timeout):
             print(f"⚠️ Stream stalled — nothing arrived for {timeout:.0f}s, cutting it off")
             return
 
-def _sse_chunk(content):
+def _sse_chunk(content, finish_reason=None):
     """One OpenAI-style streaming chunk — what SillyTavern expects when stream=true."""
     payload = {"id": "chatcmpl-brainengine2", "object": "chat.completion.chunk",
-               "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]}
+               "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": finish_reason}]}
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 def _sse_final():
@@ -1849,6 +1985,19 @@ async def impersonation_response(data, raw_messages, request=None):
 # =========================================================
 # ENDPOINTS
 # =========================================================
+REQUIRED_CONNECTOR_CAPABILITIES = {"generation_chat", "signed_prior_state"}
+
+
+def connector_compatibility(payload):
+    """Advertised capabilities diagnose deployment only; never authorize a claim."""
+    metadata = payload.get("connector") if isinstance(payload.get("connector"), dict) else {}
+    advertised = metadata.get("capabilities")
+    capabilities = {v for v in advertised if isinstance(v, str)} if isinstance(advertised, list) else set()
+    missing = sorted(REQUIRED_CONNECTOR_CAPABILITIES - capabilities)
+    return {"compatible": not missing, "version": str(metadata.get("version") or "unknown")[:40],
+            "build": str(metadata.get("build") or "unknown")[:80], "missing_capabilities": missing}
+
+
 @app.post("/api/sillytavern/context")
 async def receive_sillytavern_context(request: Request):
     """Receive a small context snapshot from the local SillyTavern extension."""
@@ -1878,6 +2027,11 @@ async def receive_sillytavern_context(request: Request):
     if not isinstance(payload.get("generation"), dict):
         raise HTTPException(status_code=422, detail="Context payload requires a generation object")
 
+    compatibility = connector_compatibility(payload)
+    warnings = []
+    if not compatibility["compatible"]:
+        warnings.append("S-MultiBrainConnecter 0.5.0以降への更新が必要です。グループやswipeの状態継承を保証できません。")
+        update_diagnostic("connector_compatibility", **compatibility)
     received_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     stored = copy.deepcopy(payload)
     stored["received_at"] = received_at
@@ -1895,6 +2049,8 @@ async def receive_sillytavern_context(request: Request):
         "accepted": True,
         "received_at": received_at,
         "generation_type": generation_type,
+        "connector": compatibility,
+        "warnings": warnings,
     }
 
 
@@ -1912,6 +2068,7 @@ async def get_sillytavern_context_status():
         "received_at": LATEST_SILLYTAVERN_CONTEXT.get("received_at"),
         "generation_type": generation.get("type"),
         "chat_id": chat.get("id"),
+        "connector": connector_compatibility(LATEST_SILLYTAVERN_CONTEXT),
     }
 
 
@@ -1999,6 +2156,7 @@ async def save_prompts(request: Request):
             payload.get("writer") if isinstance(payload, dict) else None,
             payload.get("summary") if isinstance(payload, dict) else None,
             payload.get("group_prompt") if isinstance(payload, dict) else None,
+            variables=payload.get("variables", []) if isinstance(payload, dict) else [],
         )
         return {"saved": True, **config}
     except ValueError as exc:
@@ -2018,11 +2176,11 @@ async def save_preset(request: Request):
         source = active_prompt_setup()
         result = prompt_store.save_preset(
             name, payload.get("steps"), payload.get("writer"),
-            payload.get("summary"), payload.get("group_prompt")
+            payload.get("summary"), payload.get("group_prompt"), variables=payload.get("variables", [])
         )
         config = prompt_store.validate_config(
             payload.get("steps"), payload.get("writer"), payload.get("summary"),
-            payload.get("group_prompt"), result["preset_id"], result["preset_name"])
+            payload.get("group_prompt"), result["preset_id"], result["preset_name"], payload.get("variables", []))
         active = prompt_store.save_config(**config)
         lorebook_store.ensure_profile(
             active["preset_id"], active["preset_name"],
@@ -2038,13 +2196,50 @@ async def save_preset(request: Request):
         raise HTTPException(status_code=500, detail="Could not save preset") from exc
 
 
+@app.get("/api/conversation-state")
+async def get_conversation_states():
+    return conversation_states()
+
+
+@app.post("/api/conversation-state/reset")
+async def reset_conversation_state(request: Request):
+    try:
+        payload = await request.json()
+        return {"queued": True, "message": queue_conversation_reset(
+            payload.get("chat_id"), payload.get("preset_id"), payload.get("scope"))}
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/bundles/export")
+async def export_bundle():
+    try:
+        return bundle_store.export_bundle(active_prompt_setup())
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/bundles/import")
+async def import_bundle(request: Request):
+    try:
+        payload = await request.json()
+        with bundle_store.LOCK:
+            plan = bundle_store.plan_import(payload.get("bundle"), payload.get("mode", "new"), payload.get("selected_global", []))
+            if payload.get("preview", True):
+                return {"preset": plan["preset"], "files": [str(p.name) for p in plan["writes"]],
+                        "reused": plan["reused"], "global_diff": plan["global_diff"]}
+            return bundle_store.commit(plan)
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/presets/export")
 async def export_preset(request: Request):
     try:
         payload = await request.json()
         result = prompt_store.export_preset(
             payload.get("name"), payload.get("steps"), payload.get("writer"),
-            payload.get("summary"), payload.get("group_prompt")
+            payload.get("summary"), payload.get("group_prompt"), variables=payload.get("variables", [])
         )
         return {"exported": True, **result}
     except ValueError as exc:
@@ -2421,15 +2616,75 @@ async def chat_completions(request: Request):
     # state block have dedicated structured paths and must never become chat keys.
     lore_messages = visible_messages(raw_messages)
     lore_config = active_lorebook_setup(prompt_config)
-    current_lore_state, lore_state_labels = lore_state.parse_latest(raw_messages)
+    state_chat_id = (role_binding or {}).get("chat_id") or _safe_display_name(data.get("chat_id"))
+    committed_state = conversation_state.parse_latest(raw_messages, prompt_config["preset_id"],
+        state_chat_id,
+        (role_binding or {}).get("state_branch_root", ""))
+    latest_assistant_content = next((message.get("content", "") for message in reversed(raw_messages)
+                                     if message.get("role") == "assistant"), "")
+    if committed_state is None and "<be-conversation-state-v1>" not in str(latest_assistant_content):
+        claimed_state = (role_binding or {}).get("prior_state", {}).get("state")
+        if claimed_state:
+            committed_state = conversation_state.parse_latest(
+                [{"role": "assistant", "content": "<think>" + claimed_state + "</think>"}],
+                prompt_config["preset_id"], state_chat_id, (role_binding or {}).get("state_branch_root", ""))
+    if committed_state is None and isinstance(latest_assistant_content, str) and "<be-conversation-state-v1>" in latest_assistant_content:
+        update_diagnostic("conversation_state_not_restored", reason="invalid_signature_version_or_scope", preset_id=prompt_config["preset_id"])
+    conversation_key = (prompt_config["preset_id"], state_chat_id)
+    if committed_state and state_chat_id:
+        CONVERSATION_DIAGNOSTICS[conversation_key] = {
+            "chat_id": state_chat_id, "preset_id": prompt_config["preset_id"], "preset_name": prompt_config["preset_name"],
+            "char_name": (role_binding or {}).get("char_name", ""), "status": "restored_from_history",
+            "variables": copy.deepcopy(committed_state.get("variables", {})),
+            "lore_counts": copy.deepcopy(committed_state.get("lore_counts", {})),
+            "lore_active": list(committed_state.get("lore_active", []))}
+        if len(CONVERSATION_DIAGNOSTICS) > 50:
+            CONVERSATION_DIAGNOSTICS.pop(next(iter(CONVERSATION_DIAGNOSTICS)))
+    pending_reset = PENDING_STATE_RESETS.get(conversation_key)
+    if committed_state and pending_reset and committed_state.get("applied_reset_id") == pending_reset["id"]:
+        PENDING_STATE_RESETS.pop(conversation_key, None)
+    reset_command = copy.deepcopy(PENDING_STATE_RESETS.get(conversation_key)) if not is_continue else None
+    reset_scope = reset_command.get("scope") if reset_command else None
+    variable_definitions = prompt_config.get("variables", [])
+    variable_values = variables.initial_values(variable_definitions)
+    variable_revision = 0
+    persistent_active, persistent_blocked = set(), set()
+    if committed_state:
+        current_lore_state = committed_state.get("lore_counts", {})
+        lore_state_labels = {k: tuple(v) for k, v in committed_state.get("lore_labels", {}).items()}
+        persistent_active = set(committed_state.get("lore_active", []))
+        variable_revision = committed_state.get("variable_revision", 0)
+        for definition in variable_definitions:
+            if reset_scope not in {"variables", "both"} and definition["id"] in committed_state.get("variables", {}):
+                try:
+                    variable_values[definition["id"]] = variables.validate_value(
+                        definition, committed_state["variables"][definition["id"]])
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=f"Variable definition changed; explicit reset or migration required: {exc}") from exc
+    else:
+        current_lore_state, lore_state_labels = lore_state.parse_latest(raw_messages)
+    start_state_payload = committed_state or {
+        "preset_id": prompt_config["preset_id"], "chat_id": conversation_key[1],
+        "lore_counts": copy.deepcopy(current_lore_state), "lore_labels": copy.deepcopy(lore_state_labels),
+        "lore_active": sorted(persistent_active), "variables": copy.deepcopy(variable_values),
+        "variable_revision": variable_revision,
+    }
+    if reset_scope in {"lore", "both"}:
+        current_lore_state, lore_state_labels, persistent_active = {}, {}, set()
+    if reset_scope in {"variables", "both"}:
+        variable_revision += 1
     catalog = lorebook_store.state_catalog(lore_config.get("books", []))
     current_lore_state = {
         key: count for key, count in current_lore_state.items()
-        if key in catalog and lore_state_labels.get(key) == catalog[key]
+        if key in catalog
     }
     lore_state_labels = {
         key: catalog[key] for key in current_lore_state
     }
+    persistent_active.intersection_update({entry["entry_id"] for book in lore_config.get("books", []) for entry in book["entries"]})
+    stateful_generation = bool(reset_command or variable_definitions or catalog or persistent_active or any(
+        any(entry.get("persistence", {}).values())
+        for book in lore_config.get("books", []) for entry in book["entries"])) and not is_continue
     injected_lore_keys = []
     injected_lore_labels = {}
 
@@ -2438,10 +2693,15 @@ async def chat_completions(request: Request):
     # =========================================================
     reasoning_steps = [] if is_continue else copy.deepcopy(prompt_config["steps"])
     reasoning_results = []
+    completed_outputs = []
     prior_context = ""
     if is_continue:
         progress_log("⏭️ Continue mode: reasoning steps skipped; Writer follows the existing text directly.")
     for index, slot in enumerate(reasoning_steps):
+        selected_outputs, missing_ids = resolve_prior_outputs(slot, completed_outputs)
+        if missing_ids:
+            update_diagnostic("missing_prior_outputs", step_id=slot["id"], omitted_ids=missing_ids)
+        selected_context = "\n".join(item["wrapped_text"] for item in selected_outputs)
         past_outputs, inheritance = extract_step_history(history_turns, slot)
         inheritance.update({
             "selected_turns": len(selected_turns), "parsed_turns": len(history_turns),
@@ -2450,15 +2710,33 @@ async def chat_completions(request: Request):
         })
         lore_result = activated_lore_for_agent(
             lore_messages, prompt_config, role_binding, str(slot["id"]),
-            prior_outputs=reasoning_results, past_outputs=past_outputs,
+            prior_outputs=[item["raw_text"] for item in selected_outputs], past_outputs=past_outputs,
             state=current_lore_state, config=lore_config,
+            persistent_active=persistent_active, persistent_blocked=persistent_blocked,
         )
         injected_lore_keys.extend(lore_result["injected_state_keys"])
         injected_lore_labels.update(lore_result["state_labels"])
         prepared_slot = expand_agent_prompt(
-            prompt_with_order(
-                prompt_with_lore(slot, lore_result["text"]), request_orders),
+            prompt_with_order(slot, request_orders),
             role_binding, prompt_config.get("group_prompt", ""))
+        prepared_slot = prompt_with_lore(prepared_slot, lore_result["text"])
+        prepared_slot["prompt"] += "\n" + variables.input_context(
+            variable_definitions, variable_values, variable_revision, slot["id"],
+            expand_role_placeholders(slot.get("variable_update_prompt", ""), role_binding))
+        step_messages = messages_mind
+        if slot.get("exclude_chat_log", False):
+            step_messages = []
+            allowed_connector = (role_binding or {}).get("connector_context", "")
+            if allowed_connector:
+                prepared_slot["prompt"] += "\n\n" + allowed_connector
+            else:
+                update_diagnostic("chat_exclusion", step_id=slot["id"], connector="unavailable_or_unmatched", fallback_to_chat=False)
+        model_prior = selected_context if slot.get("inject_prior_outputs", True) else ""
+        model_past = past_outputs if slot.get("inject_past_same_step_outputs", True) else ()
+        inheritance.update({"selected_prior_ids": [item["id"] for item in selected_outputs],
+                            "missing_prior_ids": missing_ids,
+                            "exclude_chat_log": slot.get("exclude_chat_log", False),
+                            "retrieved_past_outputs": len(past_outputs)})
         use_main = index == len(reasoning_steps) - 1
         provider_label = "main" if use_main or not LOGIC_ENABLED else "background"
         stage = f"Step {index + 1}/{len(reasoning_steps)}"
@@ -2466,9 +2744,9 @@ async def chat_completions(request: Request):
         generation_progress(turn_id, stage, "started", provider_label)
         try:
             result = await run_reasoning_step(
-                prepared_slot, messages_mind, prior_context,
+                prepared_slot, step_messages, model_prior,
                 use_main=use_main, temp=slot["temperature"], request=request,
-                past_outputs=past_outputs, inheritance=inheritance,
+                past_outputs=model_past, inheritance=inheritance,
             )
         except (asyncio.CancelledError, ClientDisconnected):
             generation_progress(turn_id, stage, "interrupted", provider_label,
@@ -2480,7 +2758,17 @@ async def chat_completions(request: Request):
             raise
         generation_progress(turn_id, stage, "completed", provider_label,
                             time.monotonic() - step_start)
+        previous_variable_values = copy.deepcopy(variable_values)
+        result, variable_values, variable_revision, variable_error = variables.apply_output(
+            result, variable_definitions, variable_values, variable_revision, slot["id"])
+        if variable_values != previous_variable_values:
+            update_diagnostic("variable_update_applied", step_id=slot["id"], revision=variable_revision,
+                changed_ids=[key for key in variable_values if variable_values[key] != previous_variable_values.get(key)])
+        if variable_error:
+            update_diagnostic("variable_update_rejected", step_id=slot["id"], reason=variable_error, revision=variable_revision)
         reasoning_results.append(result)
+        completed_outputs.append({"id": slot["id"], "step": slot["step"], "raw_text": result,
+                                  "wrapped_text": wrap_step_output(slot, result)})
         remember_agent_output(slot["id"], slot["name"], result)
         prior_context += "\n" + wrap_step_output(slot, result) + "\n"
 
@@ -2519,17 +2807,19 @@ async def chat_completions(request: Request):
     writer_lore = activated_lore_for_agent(
         lore_messages, prompt_config, role_binding, "writer",
         prior_outputs=reasoning_results, state=current_lore_state,
-        config=lore_config,
+        config=lore_config, persistent_active=persistent_active, persistent_blocked=persistent_blocked,
     )
     injected_lore_keys.extend(writer_lore["injected_state_keys"])
     injected_lore_labels.update(writer_lore["state_labels"])
     writer_config = expand_agent_prompt(
         prompt_with_order(
-            prompt_with_lore(prompt_config["writer"], writer_lore["text"]),
-            request_orders),
+            prompt_config["writer"], request_orders),
         role_binding,
         prompt_config.get("group_prompt", "")
     )
+    writer_config = prompt_with_lore(writer_config, writer_lore["text"])
+    writer_config["prompt"] += "\n" + variables.input_context(
+        variable_definitions, variable_values, variable_revision, "writer")
     writer_prompt = writer_config["prompt"]
     writer_temperature = writer_config["temperature"]
     task_6, writer_budget_metadata = build_agent_messages(
@@ -2565,7 +2855,31 @@ async def chat_completions(request: Request):
     next_lore_state, next_lore_labels = lore_state.advance(
         current_lore_state, lore_state_labels,
         injected_lore_keys, injected_lore_labels)
-    information_block = lore_state.serialize(next_lore_state, next_lore_labels)
+    information_block = ""
+    def committed_thought():
+        if not stateful_generation:
+            return thought_block
+        if is_continue:
+            return ""
+        block = conversation_state.serialize({
+            "preset_id": prompt_config["preset_id"], "chat_id": conversation_key[1],
+            "lore_counts": next_lore_state, "lore_labels": next_lore_labels,
+            "lore_active": sorted(persistent_active), "variables": variable_values,
+            "lineage": list(dict.fromkeys([v for v in [*(committed_state or {}).get("lineage", []), (role_binding or {}).get("state_branch_root", "")] if v])),
+            "variable_revision": variable_revision,
+            "applied_reset_id": reset_command["id"] if reset_command else (committed_state or {}).get("applied_reset_id"),
+        })
+        if conversation_key[1]:
+            CONVERSATION_DIAGNOSTICS[conversation_key] = {
+                "chat_id": conversation_key[1], "preset_id": conversation_key[0],
+                "preset_name": prompt_config["preset_name"],
+                "char_name": (role_binding or {}).get("char_name", ""),
+                "previous_variables": copy.deepcopy(start_state_payload.get("variables", {})),
+                "variables": copy.deepcopy(variable_values), "variable_revision": variable_revision,
+                "lore_counts": copy.deepcopy(next_lore_state), "lore_active": sorted(persistent_active)}
+        if len(CONVERSATION_DIAGNOSTICS) > 50:
+            CONVERSATION_DIAGNOSTICS.pop(next(iter(CONVERSATION_DIAGNOSTICS)))
+        return thought_block.replace("<think>\n", "<think>\n" + block + "\n", 1)
     information_prefix = f"{information_block}\n" if information_block else ""
     thought_block = "" if is_continue else (
         f"<think>\n{information_prefix}{snapshot_text}\n"
@@ -2574,19 +2888,29 @@ async def chat_completions(request: Request):
         f"[/DEEP DIVE]\n</think>\n\n"
     )
 
+    def failed_thought():
+        if not stateful_generation:
+            return thought_block
+        if is_continue:
+            return ""
+        old_block = conversation_state.serialize(start_state_payload)
+        return thought_block.replace("<think>\n", "<think>\n" + old_block + "\n", 1)
+
     # =========================================================
     # STREAMING PATH (the OpenAI-compatible client asked for stream=true)
-    # The thought snapshot streams first, then the prose as it is written.
+    # Stateful turns send body, authenticated think and completion in one event.
+    # Other turns preserve incremental streaming.
     # =========================================================
     if data.get("stream"):
         progress_log(f"✍️ A6 (Writer)  : streaming reply...")
         async def event_stream():
             full_parts = []
+            provider_finished = False
             a6_start = time.time()
             writer_failed = False
             generation_progress(turn_id, "Writer", "started", "main")
             try:
-                if thought_block:
+                if not stateful_generation and thought_block:
                     yield _sse_chunk(thought_block)
                 stream = await active_writer_client.chat.completions.create(
                     model=active_writer_model,
@@ -2600,10 +2924,16 @@ async def chat_completions(request: Request):
                     async for part in _stream_with_timeout(stream, STREAM_STALL_TIMEOUT):
                         if not part.choices:
                             continue
+                        finish = getattr(part.choices[0], "finish_reason", None)
+                        if finish is not None:
+                            provider_finished = finish in {"stop", "length"}
                         delta = part.choices[0].delta.content or ""
                         if delta:
                             full_parts.append(delta)
-                            yield _sse_chunk(delta)
+                            if not stateful_generation:
+                                yield _sse_chunk(delta)
+                    if not provider_finished:
+                        writer_failed = True
                 finally:
                     await stream.close()
             except asyncio.CancelledError:
@@ -2620,7 +2950,9 @@ async def chat_completions(request: Request):
             if needs_fallback:
                 fallback = "*The character grimaces, struggling to process their thoughts.*"
                 full_parts.append(fallback)
-                yield _sse_chunk(fallback)
+                if not stateful_generation:
+                    yield _sse_chunk(fallback)
+
             final_text = "".join(full_parts)
             remember_agent_output("writer", prompt_config["writer"]["name"], final_text)
             remember_debug_trace("writer", prompt_config["writer"].get("name"), task_6, final_text, "finaloutput")
@@ -2628,7 +2960,11 @@ async def chat_completions(request: Request):
                 generation_progress(turn_id, "Writer",
                                     "fallback reply" if needs_fallback else "completed", "main",
                                     time.time() - a6_start)
-            yield _sse_final()
+            completed = not writer_failed and not needs_fallback
+            if stateful_generation:
+                yield _sse_chunk((committed_thought() if completed else failed_thought()) + final_text, finish_reason="stop")
+            else:
+                yield _sse_final()
             yield "data: [DONE]\n\n"
             progress_log(f"📤 Reply streamed to client for {char_name} "
                          f"({time.time()-a6_start:.0f}s, {len(final_text)} chars, turn took {time.time()-turn_start:.0f}s total)")
@@ -2652,6 +2988,7 @@ async def chat_completions(request: Request):
             request=request,
             context_snapshot=writer_context_snapshot,
             preflight_complete=True,
+            raise_on_error=True, require_completed=stateful_generation,
         )
     except (asyncio.CancelledError, ClientDisconnected):
         generation_progress(turn_id, "Writer", "interrupted", "main",
@@ -2673,11 +3010,13 @@ async def chat_completions(request: Request):
         "object": "chat.completion",
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": thought_block + final_roleplay_text},
+            "message": {"role": "assistant", "content": committed_thought() + final_roleplay_text},
             "finish_reason": "stop"
         }]
     }
     return JSONResponse(response_payload)
+
+bundle_store.recover()
 
 try:
     import sys as _sys

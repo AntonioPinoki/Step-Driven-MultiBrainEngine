@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 from typing import Any
 
 import context_detection
@@ -456,12 +458,34 @@ def create_ui(server: Any, language: str = "ja"):
                     i18n=tr,
                 )
 
+            with gr.Tab("チャット状態"):
+                gr.Markdown("正常完了した接続チャットの状態。リセットは選択したチャットの次回通常生成に適用し、履歴へ保存します。Continueでは更新しません。")
+                state_list = gr.JSON(label="最近の確定状態")
+                state_refresh = gr.Button("状態を更新")
+                state_target = gr.Dropdown(choices=[], label="対象チャットとプリセット")
+                state_scope = gr.Radio(choices=[("ロアだけ", "lore"), ("変数だけ", "variables"), ("両方", "both")], value="both", label="リセット範囲")
+                reset_button = gr.Button("選択チャットのリセットを予約")
+                reset_status = gr.Markdown()
+                def refresh_conversation_states():
+                    information = server.conversation_states()
+                    choices = [(f"{item.get('char_name') or item['chat_id']} · {item['chat_id']} / {item.get('preset_name') or item['preset_id']}",
+                                json.dumps([item["chat_id"], item["preset_id"]])) for item in information["states"]]
+                    return information, gr.update(choices=choices)
+                def reset_conversation(target, scope):
+                    if not target:
+                        raise gr.Error("対象チャットを選択してください")
+                    chat_id, preset_id = json.loads(target)
+                    return server.queue_conversation_reset(chat_id, preset_id, scope)
+                state_refresh.click(refresh_conversation_states, outputs=[state_list, state_target])
+                reset_button.click(reset_conversation, [state_target, state_scope], reset_status)
+
             with gr.Tab(tr("prompt_assistant")):
                 assistant_ui = build_prompt_assistant(
                     gr, text=ui_text.t, language=language, get_context=assistant_context,
                     save_orders=save_orders, stream_reply=stream_assistant, i18n=tr,
                 )
 
+        demo.load(None, js=Path(__file__).with_name("lore_navigation.js").read_text(encoding="utf-8"))
         demo.load(
             load_providers, None,
             [main_url, main_model, main_key, main_context, main_mode,
@@ -471,19 +495,11 @@ def create_ui(server: Any, language: str = "ja"):
              server_status, multibrain_api, main_provider_api, logic_provider_api],
         )
         prompt_load_event = demo.load(
-            prompt_ui.callbacks.load, None, prompt_ui.form_outputs,
+            prompt_ui.load_form, None, prompt_ui.load_outputs,
         )
         prompt_load_event.then(
-            prompt_ui.refresh_step_ui,
-            prompt_ui.step_state_inputs,
-            prompt_ui.step_ui_outputs,
-            show_progress="hidden",
-        )
-        prompt_tab.select(
-            prompt_ui.refresh_step_ui,
-            prompt_ui.step_state_inputs,
-            prompt_ui.step_ui_outputs,
-            show_progress="hidden",
+            prompt_ui.refresh_references, prompt_ui.reference_inputs,
+            prompt_ui.reference_outputs, show_progress="hidden",
         )
         demo.load(lore_ui["load"], None, lore_ui["load_outputs"])
         lore_tab.select(
@@ -494,12 +510,6 @@ def create_ui(server: Any, language: str = "ja"):
         prompt_ui.save_event.then(
             assistant_ui["refresh"], assistant_ui["refresh_inputs"],
             assistant_ui["load_outputs"], show_progress="hidden",
-        )
-        prompt_ui.save_event.then(
-            prompt_ui.refresh_step_ui,
-            prompt_ui.step_state_inputs,
-            prompt_ui.step_ui_outputs,
-            show_progress="hidden",
         )
         for identity_event in prompt_ui.identity_events:
             identity_event.then(

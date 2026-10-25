@@ -1,3 +1,4 @@
+import persistent_lore
 import copy
 import json
 import os
@@ -13,7 +14,7 @@ LOREBOOK_DIR = os.path.join(PROJECT_ROOT, "Lorebooks")
 BOOKS_DIR = os.path.join(LOREBOOK_DIR, "books")
 SETTINGS_FILE = os.path.join(LOREBOOK_DIR, "settings.json")
 MAX_BOOK_BYTES = 8 * 1024 * 1024
-_lock = threading.Lock()
+from storage_lock import LOCK as _lock
 
 DEFAULT_SETTINGS = {
     "scan_depth": 2,
@@ -144,6 +145,8 @@ def validate_entry(raw, index=0):
         raise ValueError(f"{name} content must be 100000 characters or fewer")
     probability = raw.get("probability", 100)
     probability = max(0, min(100, int(probability if probability is not None else 100)))
+    group_weight = raw.get("group_weight", raw.get("groupWeight", 100))
+    group_weight = int(group_weight if group_weight is not None else 100)
     brain = _brainengine_fields(raw)
     condition_mode = str(raw.get("condition_mode", brain.get("condition_mode", "normal")))
     observation_mode = str(raw.get("observation_mode", brain.get("observation_mode", "standard")))
@@ -186,6 +189,7 @@ def validate_entry(raw, index=0):
     normalized_stages = _stages(raw.get("stages", brain.get("stages")), content)
     if content_mode == "staged" and not any(stage.strip() for stage in normalized_stages):
         raise ValueError(f"{name} staged content requires at least one non-empty stage")
+    persistence = persistent_lore.validate(raw.get("persistence", brain.get("persistence")), condition_mode)
     extension_copy = _clone(raw.get("extensions") or {})
     extension_copy["brainengine"] = {
         **_clone(brain),
@@ -198,6 +202,7 @@ def validate_entry(raw, index=0):
         "condition_data": _clone(condition_data),
         "content_mode": content_mode,
         "stages": normalized_stages,
+        "persistence": persistence,
     }
     return {
         "id": _identifier(raw.get("id") or raw.get("uid") or f"entry_{index + 1}", "entry"),
@@ -223,13 +228,14 @@ def validate_entry(raw, index=0):
         "delay": _nullable_int(raw.get("delay"), 0, 1000),
         "group": str(raw.get("group") or "")[:100],
         "group_override": bool(raw.get("group_override", raw.get("groupOverride", False))),
-        "group_weight": int(raw.get("group_weight", raw.get("groupWeight", 100)) or 100),
+        "group_weight": group_weight,
         "observation_mode": observation_mode,
         "observation_sources": sources,
         "condition_mode": condition_mode,
         "condition_data": condition_data,
         "content_mode": content_mode,
         "stages": extension_copy["brainengine"]["stages"],
+        "persistence": persistence,
         "extensions": extension_copy,
     }
 
@@ -257,6 +263,15 @@ def _source_entry_location(data):
 def _source_entries(data):
     _, _, entries = _source_entry_location(data)
     return list(entries.values()) if isinstance(entries, dict) else entries
+
+
+def _entry_field(source, extensions, internal, external=None, default=None):
+    """Read native keys first, preserving explicit false, zero and null values."""
+    for owner, keys in ((source, (internal, external)), (extensions, (internal, external))):
+        for key in keys:
+            if key is not None and key in owner:
+                return owner[key]
+    return default
 
 
 def import_sillytavern(data, fallback_name="Imported Lorebook", book_id=None, strict=True):
@@ -291,29 +306,29 @@ def import_sillytavern(data, fallback_name="Imported Lorebook", book_id=None, st
             "secondary_keys": source.get("keysecondary", source.get("secondary_keys", [])),
             "constant": source.get("constant", False),
             "selective": source.get("selective", False),
-            "selective_logic": source.get("selectiveLogic", ext.get("selectiveLogic", 0)),
+            "selective_logic": _entry_field(source, ext, "selective_logic", "selectiveLogic", 0),
             "enabled": source.get("enabled", not source.get("disable", False)),
             "order": source.get("order", source.get("insertion_order", 0)),
-            "scan_depth": source.get("scanDepth", ext.get("scan_depth")),
-            "case_sensitive": source.get("caseSensitive", ext.get("case_sensitive")),
-            "match_whole_words": source.get("matchWholeWords", ext.get("match_whole_words")),
-            "use_probability": source.get("useProbability", ext.get("useProbability", False)),
+            "scan_depth": _entry_field(source, ext, "scan_depth", "scanDepth"),
+            "case_sensitive": _entry_field(source, ext, "case_sensitive", "caseSensitive"),
+            "match_whole_words": _entry_field(source, ext, "match_whole_words", "matchWholeWords"),
+            "use_probability": _entry_field(source, ext, "use_probability", "useProbability", False),
             "probability": source.get("probability", ext.get("probability", 100)),
-            "exclude_recursion": source.get("excludeRecursion", ext.get("exclude_recursion", False)),
-            "prevent_recursion": source.get("preventRecursion", ext.get("prevent_recursion", False)),
+            "exclude_recursion": _entry_field(source, ext, "exclude_recursion", "excludeRecursion", False),
+            "prevent_recursion": _entry_field(source, ext, "prevent_recursion", "preventRecursion", False),
             "sticky": source.get("sticky", ext.get("sticky")),
             "cooldown": source.get("cooldown", ext.get("cooldown")),
             "delay": source.get("delay", ext.get("delay")),
             "group": source.get("group", ext.get("group", "")),
-            "group_override": source.get("groupOverride", ext.get("group_override", False)),
-            "group_weight": source.get("groupWeight", ext.get("group_weight", 100)),
+            "group_override": _entry_field(source, ext, "group_override", "groupOverride", False),
+            "group_weight": _entry_field(source, ext, "group_weight", "groupWeight", 100),
             "extensions": ext,
         }
         candidate.update({
             key: _clone(source[key])
             for key in (
                 "entry_id", "observation_mode", "observation_sources",
-                "condition_mode", "condition_data", "content_mode", "stages",
+                "condition_mode", "condition_data", "content_mode", "stages", "persistence",
             )
             if key in source
         })
@@ -740,6 +755,9 @@ def _merge_native_entry(source, desired, st_style):
     if isinstance(desired_extensions.get("brainengine"), dict):
         extensions["brainengine"] = _clone(desired_extensions["brainengine"])
     merged["extensions"] = extensions
+    for field in ("entry_id", "observation_mode", "observation_sources", "condition_mode", "condition_data", "content_mode", "stages", "persistence"):
+        if field in merged:
+            merged[field] = _clone(desired[field])
     return merged
 
 
@@ -826,7 +844,38 @@ def _validate_draft_preset(raw, preset_id):
             "The active prompt preset changed. Reload Lorebooks before saving.")
 
 
+def validate_persistence_graph(books):
+    catalog = {}
+    normalized = []
+    for book in books:
+        for index, raw in enumerate(book.get("entries", [])):
+            entry = validate_entry(raw, index)
+            normalized.append(entry)
+            catalog.setdefault(entry["entry_id"], []).append(entry)
+    graph = {}
+    for entry in normalized:
+        targets = entry["persistence"]["deactivates_entry_ids"]
+        if any(target not in catalog or len(catalog[target]) != 1 or target == entry["entry_id"] for target in targets):
+            raise ValueError(f"{entry['name']}: unknown, ambiguous or self stop target")
+        if targets:
+            graph[entry["entry_id"]] = targets
+    visiting, visited = set(), set()
+    def visit(identity):
+        if identity in visiting:
+            raise ValueError("Circular persistent lore stop targets")
+        if identity in visited:
+            return
+        visiting.add(identity)
+        for target in graph.get(identity, []):
+            visit(target)
+        visiting.remove(identity)
+        visited.add(identity)
+    for identity in graph:
+        visit(identity)
+
+
 def _save_books_locked(raw, document):
+    validate_persistence_graph(raw.get("books") or [])
     document["settings"] = _validate_global_settings(raw.get("settings"))
     existing = [name for name in os.listdir(BOOKS_DIR) if name.lower().endswith(".json")]
     remapped = {}
@@ -847,6 +896,14 @@ def _save_books_locked(raw, document):
                 _write_json(path, _merge_book_source(source, raw_book, filename))
         else:
             _write_json(path, _serialize_book(raw_book, filename))
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            readback = _book_semantics(json.load(handle), filename)
+        expected = _book_semantics(raw_book, filename)
+        for semantics in (readback, expected):
+            for entry in semantics["entries"]:
+                entry.pop("extensions", None)
+        if readback != expected:
+            raise ValueError(f"{filename}: saved lorebook did not match the edited values")
         existing.append(filename)
         if original_id:
             remapped[original_id] = filename
@@ -964,6 +1021,7 @@ def _prepare_import_ids(data, preserve_ids=False):
                 node["node_id"] = f"node_{uuid.uuid4().hex[:12]}"
             refresh_nodes(node.get("children"))
 
+    entry_map = {}
     for raw in raw_entries:
         if not isinstance(raw, dict):
             continue
@@ -971,9 +1029,12 @@ def _prepare_import_ids(data, preserve_ids=False):
         extensions = _clone(extensions) if isinstance(extensions, dict) else {}
         brain = extensions.get("brainengine")
         brain = _clone(brain) if isinstance(brain, dict) else {}
+        old_entry_id = raw.get("entry_id") or brain.get("entry_id") or raw.get("id") or raw.get("uid")
         existing_entry_id = raw.get("entry_id") or brain.get("entry_id")
         if not preserve_ids or not existing_entry_id:
             existing_entry_id = f"entry_{uuid.uuid4().hex[:12]}"
+        if old_entry_id is not None:
+            entry_map[_identifier(old_entry_id, "entry")] = existing_entry_id
         raw["entry_id"] = existing_entry_id
         brain["entry_id"] = existing_entry_id
         condition_data = raw.get("condition_data")
@@ -985,6 +1046,19 @@ def _prepare_import_ids(data, preserve_ids=False):
             brain["condition_data"] = _clone(condition_data)
         extensions["brainengine"] = brain
         raw["extensions"] = extensions
+    if not preserve_ids:
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                continue
+            brain = _brainengine_fields(raw)
+            persistence = _clone(raw.get("persistence", brain.get("persistence", {})))
+            targets = persistence.get("deactivates_entry_ids", [])
+            if any(target not in entry_map for target in targets):
+                raise ValueError("Single-book import cannot remap external stop targets; use a complete package")
+            persistence["deactivates_entry_ids"] = [entry_map[target] for target in targets]
+            if persistence.get("enabled") or targets or persistence.get("control_only") or persistence.get("stop_keywords"):
+                raw["persistence"] = persistence
+                raw["extensions"]["brainengine"]["persistence"] = _clone(persistence)
     return prepared
 
 

@@ -1,5 +1,7 @@
 # Step-driven MultiBrainEngine
 
+**本体バージョン：1.5.0**
+
 ## Special Thanks
 
 このプロジェクトは、[DonBananas](https://github.com/DonBananas)氏の[MultiAgent-BrainEngine-SillyTavern](https://github.com/DonBananas/MultiAgent-BrainEngine-SillyTavern)を基に、機能の追加・変更・再構成を行ったものです。素晴らしい元プロジェクトを公開してくださったDonBananas氏に、心より感謝します。
@@ -9,6 +11,18 @@ Step-driven MultiBrainEngineは、複数の推論ステップを順番に実行�
 OpenAI互換のチャットクライアントから利用でき、特定のフロントエンドだけに限定されません。プロンプトの構成、各ステップの生成設定、プロバイダー、ロアブックなどはブラウザのコントロール画面から管理できます。
 
 SillyTavern向けの連携拡張も同梱しています。この拡張を組み合わせると、キャラクターやグループチャットの情報をBrainEngineへ渡し、ロールプレイ向けの追加機能を利用できます。
+
+## 1.5.0の更新内容
+
+- 先行Stepの参照先固定と、今回／過去のStep出力を入力に含める設定を追加しました。
+- Stepごとの出力トークン上限と、チャットログを参照しない設定を追加しました。
+- 開始・終了条件で制御する継続ロアと、会話中に引き継ぐ変数・Step別の読取／更新権限を追加しました。
+- プリセットと割当済みロアブックをまとめて書き出し・読み込みできるようになりました。
+- 新規ロアの保存と未保存時の確認を改善し、個別スキャン深度・確率設定の保存不具合を修正しました。
+- Stepの並べ替え・削除に伴う参照設定の更新を修正しました。
+- SillyTavernでの名前の展開と、グループ・再生成・Continue・swipe・分岐での状態引継ぎを改善しました。
+
+SillyTavern連携を利用する場合は、同梱コネクターを **0.5.0** へ更新し、SillyTavernを再読み込みしてください。
 
 ## 主な機能
 
@@ -66,6 +80,12 @@ Logic providerは任意です。有効にすると主に推論ステップで使
 
 設定内容はローカルの`engine/config.json`へ保存されます。このファイルはAPIキーを含むため、共有や公開をしないでください。
 
+## 同梱プリセットと初期データ
+
+同梱プリセットは `Default` と `Novel_writer_Model` の2種類です。初期選択は `Default` です。Prompt Studioで切り替えたり、自分用のプリセットを作成できます。
+
+ロアブックのデータは同梱していません。Lorebooks画面で新規作成するか、手元のWorld Info JSONを読み込んでください。接続設定は初回設定時に、会話状態の署名鍵は利用時に、その環境で生成されます。
+
 ## クライアントから接続する
 
 OpenAI互換クライアントのBase URLを次のように設定します。
@@ -108,7 +128,7 @@ SillyTavern互換のWorld Info JSONを読み込み、推論ステップまたは
 
 ## SillyTavernとの連携
 
-BrainEngine本体はSillyTavern専用ではありません。同梱の`SillyTavern-extention/S-MultiBrainConnecter`は、SillyTavernのコンテキストをBrainEngineへ補足するための任意拡張です。
+BrainEngine本体はSillyTavern専用ではありません。同梱の`SillyTavern-extention/S-MultiBrainConnecter`は、SillyTavernのコンテキストをBrainEngineへ補足するための任意拡張です。継続ロア・変数をSillyTavernのグループやswipeで使う場合は、コネクター **0.5.0以降** へ更新してください。[更新手順](SillyTavern-extention/S-MultiBrainConnecter/README.md#040からの更新)を参照してください。
 
 拡張を組み合わせると、次の情報を利用できます。
 

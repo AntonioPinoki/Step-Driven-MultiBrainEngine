@@ -107,6 +107,43 @@ def add_entry(draft, book_id):
     return updated, entry["id"]
 
 
+def commit_editor_to_draft(body, book_id, entry_id, book_name, editor_values):
+    if len(editor_values) != 22:
+        raise ValueError("Lore editor field count mismatch; input was retained")
+    if find_entry(body, book_id, entry_id) is None:
+        book = find_book(body, book_id)
+        empty_defaults = ["", True, False, False, 100, 100, "standard", [], None,
+                          "normal", "", "", False, "", "", "fixed", "", "", False, "", [], False]
+        if entry_id is None and book is not None and not book.get("entries") and list(editor_values) == empty_defaults:
+            return update_book_name(body, book_id, book_name)
+        raise ValueError("The selected entry is missing; input was retained. Select or add an entry before saving.")
+    (name, enabled, constant, probability_enabled, order, probability,
+     observation, sources, depth, condition, primary, secondary, selective,
+     ordered, hierarchy, content_mode, content, stages, persistent,
+     stop_words, stop_targets, control_only) = editor_values
+    nodes = json.loads(hierarchy) if str(hierarchy or "").strip() else []
+    if isinstance(nodes, dict):
+        nodes = nodes.get("nodes", [])
+    data = ({"words": [line.strip() for line in str(ordered or "").splitlines() if line.strip()]}
+            if condition == "ordered" else {"nodes": nodes} if condition == "hierarchical" else {})
+    updated = update_book_name(body, book_id, book_name)
+    updated = update_entry(updated, book_id, entry_id, name=name, enabled=enabled, constant=constant,
+        use_probability=probability_enabled, order=order, probability=probability,
+        observation_mode=observation, observation_sources=sources, scan_depth=depth,
+        condition_mode=condition, keys=primary, secondary_keys=secondary, selective=selective,
+        condition_data=data, content_mode=content_mode, content=content,
+        stages=str(stages or "").split("\n---\n"), persistence={"enabled": persistent,
+            "stop_keywords": [line.strip() for line in str(stop_words or "").splitlines() if line.strip()],
+            "deactivates_entry_ids": stop_targets or [], "control_only": control_only})
+    try:
+        from . import lorebook_store
+    except ImportError:
+        import lorebook_store
+    selected = find_entry(updated, book_id, entry_id)
+    selected.update(lorebook_store.validate_entry(selected, 0))
+    return updated
+
+
 def delete_entry(draft, book_id, entry_id):
     updated = _copy(draft or {})
     book = find_book(updated, book_id)
@@ -254,6 +291,7 @@ def build_lorebooks(
         active_preset = gr.Markdown("")
         refresh_button = gr.Button(tr("lorebook.refresh_books"), scale=1)
     status = gr.Markdown("")
+    discard_button = gr.Button("未保存変更を破棄", elem_id="brain-lore-discard", elem_classes="brain-lore-discard-trigger")
     with gr.Accordion(tr("lorebook.preset_search_extensions"), open=False):
         character_context_search_enabled = gr.Checkbox(
             value=True, label=tr("lorebook.character_context_search_enabled"))
@@ -410,6 +448,11 @@ def build_lorebooks(
         stages = gr.Textbox(
             label=tr("lorebook.stages"), lines=10,
             info=tr("lorebook.stages_help"))
+    with gr.Accordion("継続発火・終了制御", open=False):
+        persistence_on = gr.Checkbox(value=False, label="終了条件まで継続（通常条件・固定／段階本文）")
+        stop_words = gr.Textbox(label="終了語（1行1語・既存の観測元と深度を使用）", lines=3)
+        stop_targets = gr.Dropdown(choices=[], multiselect=True, label="このエントリーが停止する対象（安定ID）")
+        control_only = gr.Checkbox(value=False, label="制御専用（本文を注入しない）")
     with gr.Accordion(tr("lorebook.application_information"), open=False):
         gr.Markdown(tr("lorebook.application_information_help"))
     with gr.Accordion(tr("lorebook.behavior_preview"), open=True):
@@ -645,16 +688,29 @@ def build_lorebooks(
             ", ".join(selected.get("secondary_keys", [])),
             selected.get("selective", False), ordered, hierarchy,
             selected.get("content_mode", "fixed"), selected.get("content", ""),
-            staged, preview, validation,
+            staged, selected.get("persistence", {}).get("enabled", False),
+            "\n".join(selected.get("persistence", {}).get("stop_keywords", [])),
+            gr.update(choices=[(e.get("name", e["entry_id"]), e["entry_id"])
+                for b in (body or {}).get("books", []) for e in b.get("entries", [])
+                if e.get("entry_id") != selected.get("entry_id")],
+                value=selected.get("persistence", {}).get("deactivates_entry_ids", [])),
+            selected.get("persistence", {}).get("control_only", False), preview, validation,
         )
 
     editor_outputs = [
         book_name, entry_name, enabled, constant, use_probability, order, probability,
         observation_mode, observation_sources, entry_scan_depth, condition_mode,
         keys, secondary_keys, selective, ordered_words, hierarchy_json,
-        content_mode, content, stages, behavior_preview, validation_message,
+        content_mode, content, stages, persistence_on, stop_words, stop_targets, control_only, behavior_preview, validation_message,
     ]
     editor_inputs = editor_outputs[:-2]
+    for component in [*editor_inputs, scan_depth, token_budget, case_sensitive, whole_words, recursive]:
+        component.elem_classes = [*(component.elem_classes or []), "brain-lore-dirty-field"]
+    for component in (book, entry, add_book_button, add_entry_button, delete_book_button,
+                      delete_entry_button, refresh_button, import_file):
+        component.elem_classes = [*(component.elem_classes or []), "brain-lore-navigation"]
+    save_entry_button.elem_id = "brain-lore-save"
+
 
     def select_book(body, book_id):
         entries = entry_choices(body, book_id)
@@ -665,48 +721,12 @@ def build_lorebooks(
         return entry_values(body, book_id, entry_id)
 
     def save_book_settings(body, book_id, entry_id, bname, *values):
-        editor_values = values[:18]
-        depth, budget, case, whole, recurse = values[18:]
+        editor_values = values[:22]
+        depth, budget, case, whole, recurse = values[22:]
         try:
-            updated = update_book_name(body, book_id, bname)
-        except ValueError as exc:
+            updated = commit_editor_to_draft(body, book_id, entry_id, bname, editor_values)
+        except (ValueError, TypeError) as exc:
             raise gr.Error(str(exc)) from exc
-        if entry_id:
-            (name, enabled_value, constant_value, probability_enabled, order_value,
-             probability_value, observation_value, sources_value, entry_depth,
-             condition_value, primary_value, secondary_value, selective_value,
-             ordered_value, hierarchy_value, content_mode_value, content_value,
-             stages_value) = editor_values
-            try:
-                hierarchy_nodes = json.loads(hierarchy_value) if str(hierarchy_value).strip() else []
-            except json.JSONDecodeError as exc:
-                raise gr.Error(f"Hierarchy JSON: {exc.msg}") from exc
-            if isinstance(hierarchy_nodes, dict):
-                hierarchy_nodes = hierarchy_nodes.get("nodes", [])
-            ordered_list = [
-                line.strip() for line in str(ordered_value or "").splitlines()
-                if line.strip()
-            ]
-            stage_list = str(stages_value or "").split("\n---\n")
-            names = (
-                "name", "enabled", "constant", "use_probability", "order",
-                "probability", "observation_mode", "observation_sources",
-                "scan_depth", "condition_mode", "keys", "secondary_keys",
-                "selective", "condition_data", "content_mode", "content", "stages",
-            )
-            prepared_values = (
-                name, enabled_value, constant_value, probability_enabled, order_value,
-                probability_value, observation_value, sources_value, entry_depth,
-                condition_value, primary_value, secondary_value, selective_value,
-                ({"words": ordered_list} if condition_value == "ordered" else
-                 {"nodes": hierarchy_nodes} if condition_value == "hierarchical" else {}),
-                content_mode_value, content_value, stage_list,
-            )
-            try:
-                updated = update_entry(
-                    updated, book_id, entry_id, **dict(zip(names, prepared_values)))
-            except ValueError as exc:
-                raise gr.Error(str(exc)) from exc
         updated["settings"] = {
             **updated.get("settings", {}), "scan_depth": int(depth),
             "token_budget": int(budget), "case_sensitive": bool(case),
@@ -716,13 +736,22 @@ def build_lorebooks(
         saved = save_books(updated)
         book_id_map = saved.pop("book_id_map", {})
         saved["assignments"] = remap_assignments(preserved_assignments, book_id_map)
+        saved_book_id = book_id_map.get(str(book_id), str(book_id))
+        restored_entry = find_entry(saved, saved_book_id, entry_id)
+        requested_entry = find_entry(updated, book_id, entry_id)
+        if requested_entry is not None and restored_entry is None:
+            raise gr.Error("保存後の対象エントリーを確認できません。入力は保持しています。再読み込み前に内容を控えてください。")
+        for field in ("name", "content", "keys", "secondary_keys", "content_mode", "stages", "persistence"):
+            if requested_entry is not None and restored_entry.get(field) != requested_entry.get(field):
+                raise gr.Error(f"保存後の {field} が入力と一致しません。入力は保持しています。")
         return all_values(
             saved, tr("lorebook.books_saved_status"),
             book_id_map.get(str(book_id), str(book_id)), entry_id)
 
     def create_book(body):
         updated, book_id = add_book(body)
-        return updated, gr.Dropdown(choices=book_choices(updated), value=book_id), gr.Dropdown(choices=[], value=None), *entry_values(updated, book_id, None)
+        updated, entry_id = add_entry(updated, book_id)
+        return updated, gr.Dropdown(choices=book_choices(updated), value=book_id), gr.Dropdown(choices=entry_choices(updated, book_id), value=entry_id), *entry_values(updated, book_id, entry_id)
 
     def remove_book_file(book_id):
         if not book_id:
@@ -840,7 +869,8 @@ def build_lorebooks(
             lambda text, index, word, selected_action=action: ordered_action(
                 text, index, word, selected_action),
             [ordered_words, ordered_index, ordered_new_word],
-            [ordered_words, ordered_index], show_progress="hidden")
+            [ordered_words, ordered_index], show_progress="hidden").success(
+                None, js="() => window.dispatchEvent(new Event('brain-lore-dirty'))")
 
     def hierarchy_action(text, path, action):
         try:
@@ -857,20 +887,25 @@ def build_lorebooks(
             lambda text, path, selected_action=action: hierarchy_action(
                 text, path, selected_action),
             [hierarchy_json, hierarchy_path], [hierarchy_json, hierarchy_path],
-            show_progress="hidden")
+            show_progress="hidden").success(
+                None, js="() => window.dispatchEvent(new Event('brain-lore-dirty'))")
 
     save_entry_event = save_entry_button.click(
         save_book_settings,
         [draft, book, entry, *editor_inputs, scan_depth, token_budget,
          case_sensitive, whole_words, recursive],
         load_outputs)
+    save_entry_event.success(None, js="() => window.dispatchEvent(new Event('brain-lore-saved'))")
+    save_entry_event.failure(None, js="() => window.dispatchEvent(new Event('brain-lore-save-failed'))")
     add_book_event = add_book_button.click(
         create_book, draft, [draft, book, entry, *editor_outputs])
     delete_book_event = delete_book_button.click(
         remove_book_file, book, load_outputs)
     add_entry_button.click(
-        create_entry, [draft, book, book_name], [draft, entry, *editor_outputs])
-    delete_entry_button.click(remove_entry, [draft, book, entry], [draft, entry, *editor_outputs])
+        create_entry, [draft, book, book_name], [draft, entry, *editor_outputs]).success(
+            None, js="() => window.dispatchEvent(new Event('brain-lore-dirty'))")
+    delete_entry_button.click(remove_entry, [draft, book, entry], [draft, entry, *editor_outputs]).success(
+        None, js="() => window.dispatchEvent(new Event('brain-lore-dirty'))")
     for agent_id, assigned, summary in zip(
         assignment_agent_ids, assignment_dropdowns, assignment_summaries,
     ):
@@ -886,6 +921,9 @@ def build_lorebooks(
     )
     import_event = import_file.change(import_json, [import_file, import_mode], load_outputs)
     refresh_event = refresh_button.click(load_all, None, load_outputs)
+    discard_event = discard_button.click(load_all, None, load_outputs)
+    discard_event.success(None, js="() => window.dispatchEvent(new Event('brain-lore-discarded'))")
+    add_book_event.success(None, js="() => window.dispatchEvent(new Event('brain-lore-dirty'))")
     move_event = move_target_button.click(
         move_missing_target, [missing_target, destination], load_outputs)
     remove_target_event = remove_target_button.click(

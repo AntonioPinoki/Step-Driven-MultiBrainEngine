@@ -1,4 +1,7 @@
 const MODULE_NAME = 'brainengine_connector';
+const CONNECTOR_VERSION = '0.5.0';
+const CONNECTOR_BUILD = 'state-history-v1';
+const CONNECTOR_CAPABILITIES = ['generation_chat', 'signed_prior_state'];
 const PANEL_ID = 'brainengine-connector-panel';
 const BRAINENGINE_CONTEXT_URL = 'http://127.0.0.1:8001/api/sillytavern/context';
 
@@ -146,15 +149,31 @@ function makeMessageSnapshot(message, index) {
     };
 }
 
-function buildSnapshot(rawGenerationType = 'manual') {
+function priorConversationState(chat) {
+    for (const message of [...(Array.isArray(chat) ? chat : [])].reverse()) {
+        if (message.is_user || message.is_system) continue;
+        const reasoning = String(message.extra?.reasoning ?? message.extra?.reasoning_content ?? message.mes ?? '');
+        if (!reasoning.includes('<be-conversation-state-v1>')) return null;
+        const match = reasoning.match(/<be-conversation-state-v1>\s*[^<]+<\/be-conversation-state-v1>/);
+        if (!match) return null;
+        return { role: 'assistant', name: message.name ?? null, text: message.mes ?? '', state: match[0] };
+    }
+    return null;
+}
+
+function buildSnapshot(rawGenerationType = 'manual', generationChat = null) {
     const context = SillyTavern.getContext();
     const character = getCurrentCharacter(context);
     const group = getCurrentGroup(context);
     const groupSnapshot = makeGroupSnapshot(context, group, character);
-    const lastIndex = Array.isArray(context.chat) ? context.chat.length - 1 : -1;
+    // Match the actual generation history after ST removes swipe/regenerate
+    // targets and applies prompt regex/reasoning. Manual inspection keeps raw chat.
+    const matchingChat = Array.isArray(generationChat) ? generationChat : context.chat;
+    const lastIndex = Array.isArray(matchingChat) ? matchingChat.length - 1 : -1;
 
     return {
         schema_version: 1,
+        connector: { version: CONNECTOR_VERSION, build: CONNECTOR_BUILD, capabilities: [...CONNECTOR_CAPABILITIES] },
         captured_at: new Date().toISOString(),
         source: 'sillytavern-brainengine-connector',
         generation: {
@@ -165,7 +184,9 @@ function buildSnapshot(rawGenerationType = 'manual') {
             id: context.chatId ?? null,
             message_count: Array.isArray(context.chat) ? context.chat.length : 0,
             metadata: context.chatMetadata ?? {},
-            last_message: lastIndex >= 0 ? makeMessageSnapshot(context.chat[lastIndex], lastIndex) : null,
+            last_message: lastIndex >= 0 ? makeMessageSnapshot(matchingChat[lastIndex], lastIndex) : null,
+            // Stored signed state is for internal restoration only, never model input.
+            prior_state: priorConversationState(matchingChat),
         },
         character: character ? {
             index: context.characterId,
@@ -181,8 +202,8 @@ function buildSnapshot(rawGenerationType = 'manual') {
     };
 }
 
-async function sendSnapshot(rawGenerationType = 'manual', { silent = false } = {}) {
-    const snapshot = buildSnapshot(rawGenerationType);
+async function sendSnapshot(rawGenerationType = 'manual', { silent = false, generationChat = null } = {}) {
+    const snapshot = buildSnapshot(rawGenerationType, generationChat);
     const output = document.querySelector('#brainengine-connector-output');
     if (output) {
         output.value = JSON.stringify(snapshot, null, 2);
@@ -205,8 +226,11 @@ async function sendSnapshot(rawGenerationType = 'manual', { silent = false } = {
         }
 
         const result = await response.json();
-        if (!silent) {
-            setStatus(`送信成功：${result.generation_type} / ${result.received_at}`, 'success');
+        if (Array.isArray(result.warnings) && result.warnings.length) {
+            setStatus(result.warnings.join(' / '), 'error');
+            console.warn(`[${MODULE_NAME}] Connector compatibility`, result.warnings);
+        } else if (!silent) {
+            setStatus(`送信成功：${CONNECTOR_VERSION} / ${result.generation_type} / ${result.received_at}`, 'success');
         }
         console.info(`[${MODULE_NAME}] Context sent`, result);
         return true;
@@ -224,10 +248,10 @@ async function sendSnapshot(rawGenerationType = 'manual', { silent = false } = {
     }
 }
 
-globalThis.brainEngineContextInterceptor = async function (_chat, _contextSize, _abort, type) {
+globalThis.brainEngineContextInterceptor = async function (chat, _contextSize, _abort, type) {
     // This is supplemental metadata. Delivery failure must never stop the
     // user's normal generation request.
-    await sendSnapshot(type, { silent: true });
+    await sendSnapshot(type, { silent: true, generationChat: chat });
 };
 
 function setStatus(message, kind = 'normal') {

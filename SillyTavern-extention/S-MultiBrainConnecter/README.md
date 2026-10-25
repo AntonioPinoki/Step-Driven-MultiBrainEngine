@@ -2,7 +2,9 @@
 
 Step-driven-MultiBrainEngineとSillyTavernを連携するためのUI拡張機能です。
 
-現在の版は、SillyTavernから以下の情報を読み取り、確認用JSONとして表示・送信します。
+現在の版は **0.5.0** です。本体1.5.0の継続ロア・変数の状態継承には、この版以降が必要です。
+
+SillyTavernから以下の情報を読み取り、確認用JSONとして表示・送信します。
 
 - チャットIDとメッセージ数
 - チャットメタデータ
@@ -35,6 +37,19 @@ SillyTavern/data/default-user/extensions/S-MultiBrainConnecter/
 ```
 
 配置後にSillyTavernを再読み込みし、拡張機能パネルの `S-MultiBrainConnecter` を開きます。
+
+## 0.4.0からの更新
+
+1. 現在の拡張フォルダーをバックアップします。
+2. 本体と一緒に配布されたこのフォルダーの `index.js`、`manifest.json`、`style.css` を、上記のインストール先へ上書きします。
+3. SillyTavernを再読み込みします。ブラウザーが旧JSをキャッシュしている場合はキャッシュを無効にして再読み込みします。
+4. 手動送信後、本体の `GET /api/sillytavern/context` で `connector.version` が `0.5.0`、`connector.compatible` がtrueとなることを確認します。
+
+以前の配布物には、同じ0.4.0表示でJSの内容が異なるものがありました。0.5.0では送信JSONにversion・build・capabilitiesを含め、本体が不足機能を診断します。これらは配備確認用であり、snapshotの照合や署名検証の代わりには使いません。旧版も通常送信は受理しますが、本体診断に更新案内が残ります。
+
+生成時はSTの加工後の履歴を使ってsnapshotを作り、再生成・swipeで除かれた対象と照合がずれないようにします。グループで別話者のreasoningが省略される場合には、最新assistantにある署名付き状態を補足します。未署名の最新assistantを越えて古い状態を探すことはありません。
+
+更新だけで失われた状態を自動復旧することはできません。必要なら元のswipe・分岐・バックアップを確認し、明示的に復元または状態リセットを行ってください。
 
 ## 使い方
 

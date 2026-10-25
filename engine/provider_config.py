@@ -58,6 +58,14 @@ def _optional_detected_window(value, label):
     return _context_window(value, label, default_if_missing=False)
 
 
+def _optional_output_limit(value):
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ProviderConfigError("Detected output limit must be a positive integer")
+    return value
+
+
 def _clean_provider(value, label, *, required):
     if value is None:
         value = {}
@@ -80,6 +88,7 @@ def _clean_provider(value, label, *, required):
     if mode not in CONTEXT_DETECTION_MODES:
         raise ProviderConfigError(f"{label} context_detection_mode is invalid.")
     clean["context_detection_mode"] = mode
+    clean["detected_max_output_tokens"] = _optional_output_limit(value.get("detected_max_output_tokens"))
     clean["detected_context_window"] = _optional_detected_window(
         value.get("detected_context_window"), f"{label} detected_context_window"
     )
@@ -200,6 +209,11 @@ def provider_context_runtime(provider, *, provider_name, base_url=None, model=No
             base_url if base_url is not None else provider.get("base_url")
         ),
         "effective_context_window": effective,
+        "model_max_output_tokens": provider.get("detected_max_output_tokens") if (
+            provider.get("context_detection_mode") != "manual"
+            and normalize_base_url(provider.get("detected_base_url")) == normalize_base_url(base_url if base_url is not None else provider.get("base_url"))
+            and str(provider.get("detected_model") or "").strip() == str(model if model is not None else provider.get("model") or "").strip()
+        ) else None,
     }
 
 
@@ -252,7 +266,10 @@ def detection_payload(result, *, base_url, model):
     payload = {
         "detection_status": str(result.get("status") or "failed"),
         "detection_error": str(result.get("error") or ""),
+        "detected_max_output_tokens": _optional_output_limit(result.get("model_max_output_tokens")),
     }
+    if result.get("model_max_output_tokens") is not None:
+        payload.update(detected_model=str(model or "").strip(), detected_base_url=normalize_base_url(base_url))
     if result.get("context_window") is not None:
         payload.update({
             "detected_context_window": _optional_detected_window(

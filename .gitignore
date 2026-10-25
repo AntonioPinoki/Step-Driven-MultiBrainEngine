@@ -34,3 +34,17 @@ SillyTavern-extention/SillyTavern/
 __pycache__/
 *.pyc
 *.pyo
+
+# Local authentication for committed conversation snapshots
+Lorebooks/.conversation-state-key
+
+# Public beta: local tooling, verification data and personal presets
+/.agents/
+/.codex/
+/.aws/
+/tests/
+/scripts/
+/docs/validation/
+/Preset/*.csv
+!/Preset/Default.csv
+!/Preset/Novel_writer_Model.csv

@@ -246,7 +246,19 @@ def detect_context_window(base_url, api_key, model, mode="auto", *,
     except ValueError:
         return {"status": "failed", "error": "invalid_base_url"}
 
-    requester = requester or _request_json
+    original_requester = requester or _request_json
+    output_limits = []
+    def requester(method, url, headers, body, timeout):
+        payload = original_requester(method, url, headers, body, timeout)
+        if method == "GET" and url == _models_url(base_url):
+            row = _matching_model(_model_rows(payload), model)
+            for path in (("max_output_tokens",), ("max_completion_tokens",),
+                         ("outputTokenLimit",), ("limits", "output"),
+                         ("top_provider", "max_completion_tokens")):
+                value = _read_path(row, path)
+                if type(value) is int and value > 0:
+                    output_limits.append(value)
+        return payload
     adapters = (
         ["openai", "props", "ollama", "tabby", "lm_studio"]
         if mode == "auto" else [mode]
@@ -275,6 +287,7 @@ def detect_context_window(base_url, api_key, model, mode="auto", *,
         return {
             "status": "failed",
             "error": errors[-1] if errors else "context_window_not_found",
+            "model_max_output_tokens": min(output_limits) if output_limits else None,
         }
     found.sort(key=lambda item: (_KIND_RANK.get(item[1], 99), item[0]))
     best_rank = _KIND_RANK.get(found[0][1], 99)
@@ -284,6 +297,7 @@ def detect_context_window(base_url, api_key, model, mode="auto", *,
     return {
         "status": "success",
         "context_window": selected[0],
+        "model_max_output_tokens": min(output_limits) if output_limits else None,
         "kind": selected[1],
         "source": source,
         "detected_at": datetime.now(timezone.utc).isoformat(),

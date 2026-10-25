@@ -7,12 +7,16 @@ import threading
 import time
 import uuid
 from step_history import step_output_tag
+from variables import validate_definitions
+from step_inputs import STEP_FIELDS, step_settings, normalize_references, csv_settings
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROMPTS_FILE = os.path.join(HERE, "prompts.json")
 PRESET_DIR = os.path.join(os.path.dirname(HERE), "Preset")
-_lock = threading.Lock()
+MAX_CSV_BYTES = 64 * 1024 * 1024
+csv.field_size_limit(MAX_CSV_BYTES)
+from storage_lock import LOCK as _lock
 
 
 def _clone(value):
@@ -98,7 +102,7 @@ def load_config(default_steps, default_writer, default_summary):
                     data.get("steps"), data.get("writer"), data.get("summary") or default_summary,
                     data.get("group_prompt") or "",
                     data.get("active_preset_id") or DEFAULT_PRESET_ID,
-                    data.get("active_preset_name") or DEFAULT_PRESET_NAME)
+                    data.get("active_preset_name") or DEFAULT_PRESET_NAME, data.get("variables", []))
                 return clean if data.get("version") in (6, 7, 8) else _apply_legacy_sampling_defaults(clean)
             migrated = _migrate_v1(data, default_writer)
             return _apply_legacy_sampling_defaults(validate_config(
@@ -193,7 +197,7 @@ def _sampling(raw, temperature_fallback, label):
 
 
 def validate_config(
-    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None,
+    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None, variables=None,
 ):
     if not isinstance(steps, list):
         raise ValueError("steps must be a list")
@@ -230,8 +234,9 @@ def validate_config(
         clean_steps.append({
             "id": slot_id, "name": name, "step": step, "prompt": prompt,
             **_sampling(raw, DEFAULT_STEP_TEMPERATURE, name),
+            **step_settings(raw),
         })
-    clean_steps.sort(key=lambda item: item["step"])
+    clean_steps = normalize_references(clean_steps)
 
     if not isinstance(writer, dict):
         raise ValueError("writer must be an object")
@@ -262,6 +267,7 @@ def validate_config(
         "preset_id": clean_preset_id, "preset_name": clean_preset_name,
         "steps": clean_steps, "writer": clean_writer, "summary": clean_summary,
         "group_prompt": clean_group_prompt,
+        "variables": validate_definitions(variables, clean_steps),
     }
 
 
@@ -278,20 +284,21 @@ def _saved_identity_unlocked():
 
 
 def save_config(
-    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None,
+    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None, variables=None,
 ):
     temp_file = PROMPTS_FILE + ".tmp"
     with _lock:
         current_id, current_name = _saved_identity_unlocked()
         clean = validate_config(
             steps, writer, summary, group_prompt,
-            preset_id or current_id, preset_name or current_name)
+            preset_id or current_id, preset_name or current_name, variables)
         payload = {
             "version": 8,
             "active_preset_id": clean["preset_id"],
             "active_preset_name": clean["preset_name"],
             "steps": clean["steps"], "writer": clean["writer"],
             "summary": clean["summary"], "group_prompt": clean["group_prompt"],
+            "variables": clean["variables"],
         }
         with open(temp_file, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
@@ -300,7 +307,7 @@ def save_config(
 
 
 def save_active_preset_config(
-    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None,
+    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None, variables=None,
 ):
     """Save the active runtime config and overwrite its single preset CSV."""
     json_temp = PROMPTS_FILE + ".tmp"
@@ -309,7 +316,7 @@ def save_active_preset_config(
         current_id, current_name = _saved_identity_unlocked()
         clean = validate_config(
             steps, writer, summary, group_prompt,
-            preset_id or current_id, preset_name or current_name)
+            preset_id or current_id, preset_name or current_name, variables)
         matches = [
             item["filename"] for item in list_presets()
             if item.get("preset_id") == clean["preset_id"]
@@ -331,6 +338,7 @@ def save_active_preset_config(
             "active_preset_name": clean["preset_name"],
             "steps": clean["steps"], "writer": clean["writer"],
             "summary": clean["summary"], "group_prompt": clean["group_prompt"],
+            "variables": clean["variables"],
         }
         try:
             with open(csv_temp, "w", encoding="utf-8-sig", newline="") as handle:
@@ -391,11 +399,11 @@ def distinct_preset_id(preset_id, reserved_ids=()):
 
 
 def config_to_csv(
-    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None,
+    steps, writer, summary, group_prompt="", preset_id=None, preset_name=None, variables=None,
 ):
     clean = validate_config(
         steps, writer, summary, group_prompt,
-        preset_id or _new_preset_id(), preset_name or DEFAULT_PRESET_NAME)
+        preset_id or _new_preset_id(), preset_name or DEFAULT_PRESET_NAME, variables)
     headers = ["preset_id", "preset_name"]
     headers += [f"step{number}" for number in range(1, 24)] + ["writer"]
     headers += [f"step{number}_id" for number in range(1, 24)]
@@ -424,18 +432,26 @@ def config_to_csv(
     for field in sampling_fields:
         row += [by_number.get(number, {}).get(field, "") for number in range(1, 24)]
         row += [clean["writer"][field], clean["summary"][field]]
+    for field in STEP_FIELDS:
+        headers += [f"step{number}_{field}" for number in range(1, 24)]
+        for number in range(1, 24):
+            value = by_number.get(number, {}).get(field)
+            row.append("" if value is None else value if field == "variable_update_prompt"
+                       else json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    headers.append("variables_json")
+    row.append(json.dumps(clean["variables"], ensure_ascii=False))
     buffer = io.StringIO(newline="")
     csv.writer(buffer, lineterminator="\n").writerows([headers, row])
     return buffer.getvalue()
 
 
 def save_preset(
-    name, steps, writer, summary, group_prompt="", preset_id=None, preset_name=None,
+    name, steps, writer, summary, group_prompt="", preset_id=None, preset_name=None, variables=None,
 ):
     display_name = str(preset_name or name or DEFAULT_PRESET_NAME).strip()[:100]
     actual_id = _clean_preset_id(preset_id)
     csv_text = config_to_csv(
-        steps, writer, summary, group_prompt, actual_id, display_name)
+        steps, writer, summary, group_prompt, actual_id, display_name, variables)
     filename = _safe_preset_name(name) + ".csv"
     os.makedirs(PRESET_DIR, exist_ok=True)
     path = os.path.abspath(os.path.join(PRESET_DIR, filename))
@@ -453,7 +469,7 @@ def save_preset(
 
 
 def export_preset(
-    name, steps, writer, summary, group_prompt="", preset_id=None, preset_name=None,
+    name, steps, writer, summary, group_prompt="", preset_id=None, preset_name=None, variables=None,
 ):
     """Build a downloadable preset without writing it to the Preset folder."""
     display_name = str(preset_name or name or DEFAULT_PRESET_NAME).strip()[:100]
@@ -461,7 +477,7 @@ def export_preset(
     return {
         "filename": _safe_preset_name(name) + ".csv",
         "csv": config_to_csv(
-            steps, writer, summary, group_prompt, actual_id, display_name),
+            steps, writer, summary, group_prompt, actual_id, display_name, variables),
         "preset_id": actual_id, "preset_name": display_name,
     }
 
@@ -569,7 +585,7 @@ def load_preset_file(filename, default_writer, default_summary):
 def csv_to_config(
     csv_text, default_writer, default_summary, *, preset_name="", preset_id=None,
 ):
-    if not isinstance(csv_text, str) or not csv_text.strip() or len(csv_text) > 1_000_000:
+    if not isinstance(csv_text, str) or not csv_text.strip() or len(csv_text.encode("utf-8")) > MAX_CSV_BYTES:
         raise ValueError("CSV file is empty or too large")
     try:
         rows = list(csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff"))))
@@ -590,6 +606,7 @@ def csv_to_config(
                 "id": str(row.get(f"step{number}_id") or "").strip() or _new_step_id(),
                 "name": title or f"Step {number}",
                 "step": number, "prompt": prompt,
+                **csv_settings(row, number),
                 "temperature": row.get(f"step{number}_temperature") or DEFAULT_STEP_TEMPERATURE,
                 "frequency_penalty": row.get(f"step{number}_frequency_penalty") or DEFAULT_FREQUENCY_PENALTY,
                 "presence_penalty": row.get(f"step{number}_presence_penalty") or DEFAULT_PRESENCE_PENALTY,
@@ -622,7 +639,8 @@ def csv_to_config(
     return validate_config(
         steps, writer, summary, row.get("group_prompt") or "",
         actual_preset_id,
-        row.get("preset_name") or preset_name or DEFAULT_PRESET_NAME)
+        row.get("preset_name") or preset_name or DEFAULT_PRESET_NAME,
+        json.loads(row.get("variables_json") or "[]"))
 
 
 def import_preset(csv_text, default_writer, default_summary, *, preset_name=""):
